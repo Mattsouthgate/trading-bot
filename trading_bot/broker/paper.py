@@ -7,11 +7,17 @@ Fill model (chosen to avoid look-ahead bias):
 * Market orders fill at the next bar's open, plus slippage.
 * Limit orders fill when the bar's range crosses the limit price; the
   fill price is the better of the limit and the bar open.
+* Orders are stamped with the timestamp of the last bar the broker has
+  processed and only fill on a strictly later bar — so end-of-period
+  information can never trade at that same period's prices, even across
+  symbols sharing a timestamp.
 * Buys are rejected if they would overdraw cash; sells are rejected if
-  they would exceed the held quantity (no shorting by default).
+  they would exceed the held quantity (short selling is not supported).
 """
 
 from __future__ import annotations
+
+from datetime import datetime
 
 from trading_bot.broker.base import Broker
 from trading_bot.models import (
@@ -36,6 +42,10 @@ class PaperBroker(Broker):
     ):
         if starting_cash <= 0:
             raise ValueError("starting_cash must be > 0")
+        if allow_short:
+            raise NotImplementedError(
+                "Short selling accounting is not implemented; allow_short must be False"
+            )
         self.starting_cash = starting_cash
         self._cash = starting_cash
         self.commission_per_trade = commission_per_trade
@@ -45,12 +55,14 @@ class PaperBroker(Broker):
         self._open_orders: dict[int, Order] = {}
         self.fills: list[Fill] = []
         self.rejected: list[Order] = []
+        self._now: datetime | None = None  # timestamp of the last processed bar
 
     # -- Broker interface -------------------------------------------------
 
     def submit_order(self, order: Order) -> Order:
         if order.status is not OrderStatus.OPEN:
             raise ValueError(f"Cannot submit order in status {order.status}")
+        order.submitted_at = self._now
         self._open_orders[order.id] = order
         return order
 
@@ -63,6 +75,9 @@ class PaperBroker(Broker):
 
     def get_position(self, symbol: str) -> Position:
         return self._positions.get(symbol, Position(symbol=symbol))
+
+    def positions(self) -> list[Position]:
+        return [p for p in self._positions.values() if p.quantity != 0]
 
     @property
     def cash(self) -> float:
@@ -88,9 +103,15 @@ class PaperBroker(Broker):
         return orders
 
     def process_bar(self, bar: Bar) -> list[Fill]:
+        if self._now is None or bar.timestamp > self._now:
+            self._now = bar.timestamp
         filled: list[Fill] = []
         for order in list(self._open_orders.values()):
             if order.symbol != bar.symbol:
+                continue
+            if order.submitted_at is not None and bar.timestamp <= order.submitted_at:
+                # Order was placed on information from this period (possibly
+                # another symbol's bar) — it may only fill on a later bar.
                 continue
             price = self._fill_price(order, bar)
             if price is None:
@@ -122,8 +143,10 @@ class PaperBroker(Broker):
             if cost + self.commission_per_trade > self._cash:
                 return self._reject(order, "insufficient cash")
         else:
-            if not self.allow_short and order.quantity > pos.quantity:
-                return self._reject(order, "insufficient position (shorting disabled)")
+            if order.quantity > pos.quantity:
+                return self._reject(order, "insufficient position (no short selling)")
+            if self._cash + cost < self.commission_per_trade:
+                return self._reject(order, "insufficient cash for commission")
 
         if order.side is Side.BUY:
             new_qty = pos.quantity + order.quantity

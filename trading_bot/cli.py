@@ -56,14 +56,42 @@ def cmd_backtest(args) -> int:
     if result.rejected:
         print(f"Rejected orders : {len(result.rejected)} (first: {result.rejected[0].reason})")
     if result.guard_tripped:
-        print("NOTE: drawdown guard tripped — trading halted and position liquidated.")
+        if broker.positions():
+            print(
+                "NOTE: drawdown guard tripped on the final bar — the liquidation "
+                "order could not fill; positions remain open."
+            )
+        else:
+            print("NOTE: drawdown guard tripped — trading halted and positions liquidated.")
     return 0
 
 
 def cmd_paper(args) -> int:
     broker, strategy, guard = _build(args)
     state_path = Path(args.state)
-    broker = PaperTradingEngine.load_broker(state_path, broker)
+    resuming = state_path.exists()
+    broker, guard, halted = PaperTradingEngine.load_session(state_path, broker, guard)
+    if resuming:
+        mismatched = sorted(
+            {p.symbol for p in broker.positions() if p.symbol != args.symbol}
+        )
+        if mismatched:
+            print(
+                f"Error: saved session {state_path} holds positions in "
+                f"{', '.join(mismatched)} but this run trades {args.symbol!r}. "
+                "Use the matching --symbol or a different --state file."
+            )
+            return 1
+        print(
+            f"Resuming session from {state_path} — cash, positions, fills, "
+            "guard state and halt flag come from the saved session "
+            "(--cash/--commission/--slippage-bps are ignored on resume)."
+        )
+        if halted:
+            print(
+                "This session is HALTED by its drawdown guard; it will not trade. "
+                "Delete the state file to start fresh."
+            )
     feed = SyntheticDataFeed(
         args.symbol,
         start_price=args.start_price,
@@ -74,7 +102,7 @@ def cmd_paper(args) -> int:
         speed=args.speed,
     )
     engine = PaperTradingEngine(
-        feed, strategy, broker, state_path=state_path, guard=guard
+        feed, strategy, broker, state_path=state_path, guard=guard, halted=halted
     )
     print(
         f"Paper trading {strategy.describe()} on synthetic {args.symbol} "

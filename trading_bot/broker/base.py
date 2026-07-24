@@ -26,6 +26,14 @@ class Broker(abc.ABC):
     def get_position(self, symbol: str) -> Position:
         """Current position for a symbol (zero quantity if flat)."""
 
+    @abc.abstractmethod
+    def positions(self) -> list[Position]:
+        """All non-flat positions."""
+
+    @abc.abstractmethod
+    def open_orders(self, symbol: str | None = None) -> list[Order]:
+        """Pending (unfilled, uncancelled) orders, optionally per symbol."""
+
     @property
     @abc.abstractmethod
     def cash(self) -> float:

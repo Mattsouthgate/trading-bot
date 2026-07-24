@@ -12,8 +12,10 @@ from trading_bot.models import Bar
 
 
 class PositionSizer:
-    """Risk a fixed fraction of current equity per entry, with a cash
-    buffer so slippage/commission on the next open cannot bounce the order."""
+    """Spend a fixed fraction of available cash per entry, holding back a
+    small buffer for commission and slippage at the next open. A gap up
+    larger than the buffer can still bounce the order; a bounced (rejected)
+    entry is safe — the strategy simply stays flat."""
 
     def __init__(self, fraction: float = 0.95, cash_buffer: float = 0.02):
         if not 0 < fraction <= 1:
@@ -47,3 +49,19 @@ class DrawdownGuard:
         if not self.tripped and equity < self.peak * (1 - self.max_drawdown):
             self.tripped = True
         return self.tripped
+
+    # Persisted with paper sessions so a restart cannot silently re-arm
+    # a tripped guard (restarting after a blowout is a human decision).
+    def to_state(self) -> dict:
+        return {
+            "max_drawdown": self.max_drawdown,
+            "peak": self.peak,
+            "tripped": self.tripped,
+        }
+
+    @classmethod
+    def from_state(cls, state: dict) -> "DrawdownGuard":
+        guard = cls(max_drawdown=state["max_drawdown"])
+        guard.peak = state["peak"]
+        guard.tripped = state["tripped"]
+        return guard

@@ -57,12 +57,29 @@ class TestRoundTrips(unittest.TestCase):
         # 10 @ (130-100) + 5 @ (130-120) = 350
         self.assertEqual(pnls, [350.0])
 
-    def test_commission_reduces_pnl(self):
+    def test_commissions_on_both_sides_reduce_pnl(self):
         pnls = round_trips([
-            fill(Side.BUY, 1, 100),
+            fill(Side.BUY, 1, 100, commission=0.5),
             fill(Side.SELL, 1, 101, commission=0.5),
         ])
-        self.assertEqual(pnls, [0.5])
+        self.assertEqual(pnls, [0.0])
+
+    def test_buy_commission_alone_reduces_pnl(self):
+        # A marginal trade must not be flattered into a winner by
+        # ignoring the entry commission.
+        pnls = round_trips([
+            fill(Side.BUY, 10, 100, commission=5.0),
+            fill(Side.SELL, 10, 100.5, commission=0.0),
+        ])
+        self.assertEqual(pnls, [0.0])
+
+    def test_buy_commission_prorated_across_partial_exits(self):
+        pnls = round_trips([
+            fill(Side.BUY, 10, 100, commission=10.0),  # 1.0 per unit
+            fill(Side.SELL, 4, 110),
+            fill(Side.SELL, 6, 120),
+        ])
+        self.assertEqual(pnls, [4 * 10 - 4.0, 6 * 20 - 6.0])
 
 
 class TestCompute(unittest.TestCase):

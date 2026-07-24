@@ -8,7 +8,6 @@ them without depending on each other.
 from __future__ import annotations
 
 import enum
-import itertools
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -53,7 +52,34 @@ class Bar:
             raise ValueError("Bar volume must be >= 0")
 
 
-_order_ids = itertools.count(1)
+class _OrderIdGenerator:
+    """Monotonic order-id source that can be fast-forwarded on session
+    resume so ids stay unique across process restarts."""
+
+    def __init__(self, start: int = 1):
+        self._next = start
+
+    def __call__(self) -> int:
+        value = self._next
+        self._next += 1
+        return value
+
+    def peek(self) -> int:
+        return self._next
+
+    def ensure_at_least(self, value: int) -> None:
+        self._next = max(self._next, value)
+
+
+_order_ids = _OrderIdGenerator()
+
+
+def peek_next_order_id() -> int:
+    return _order_ids.peek()
+
+
+def ensure_order_ids_at_least(value: int) -> None:
+    _order_ids.ensure_at_least(value)
 
 
 @dataclass
@@ -63,9 +89,13 @@ class Order:
     quantity: float
     order_type: OrderType = OrderType.MARKET
     limit_price: float | None = None
-    id: int = field(default_factory=lambda: next(_order_ids))
+    id: int = field(default_factory=_order_ids)
     status: OrderStatus = OrderStatus.OPEN
     reason: str = ""
+    # Stamped by the broker on submission with the timestamp of the last
+    # bar it has processed; fills require a strictly later bar, which is
+    # what prevents look-ahead even across symbols sharing a timestamp.
+    submitted_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.quantity <= 0:
