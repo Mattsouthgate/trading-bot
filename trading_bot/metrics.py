@@ -76,20 +76,24 @@ def sharpe_ratio(equity: list[float]) -> float | None:
 
 
 def round_trips(fills: list[Fill]) -> list[float]:
-    """Realised PnL per closed lot, FIFO-matched per symbol."""
-    lots: dict[str, list[list[float]]] = {}  # symbol -> [[qty, price], ...]
+    """Realised PnL per closing fill, FIFO-matched per symbol, net of
+    commissions on BOTH sides (the buy commission is carried on each lot
+    pro-rata and charged as the lot is consumed)."""
+    # symbol -> [[qty, price, buy_commission_per_unit], ...]
+    lots: dict[str, list[list[float]]] = {}
     pnls: list[float] = []
     for fill in fills:
         book = lots.setdefault(fill.symbol, [])
         if fill.side is Side.BUY:
-            book.append([fill.quantity, fill.price])
+            per_unit = fill.commission / fill.quantity if fill.quantity else 0.0
+            book.append([fill.quantity, fill.price, per_unit])
         else:
             remaining = fill.quantity
             realised = 0.0
             while remaining > 1e-9 and book:
                 lot = book[0]
                 matched = min(lot[0], remaining)
-                realised += (fill.price - lot[1]) * matched
+                realised += (fill.price - lot[1]) * matched - lot[2] * matched
                 lot[0] -= matched
                 remaining -= matched
                 if lot[0] <= 1e-9:

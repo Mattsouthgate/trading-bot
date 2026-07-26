@@ -50,7 +50,49 @@ class TestPaperBrokerMarketOrders(unittest.TestCase):
         fills = self.broker.process_bar(make_bar(100))
         self.assertEqual(fills, [])
         self.assertEqual(self.broker.rejected[0].reason,
-                         "insufficient position (shorting disabled)")
+                         "insufficient position (no short selling)")
+
+    def test_allow_short_is_not_implemented(self):
+        with self.assertRaises(NotImplementedError):
+            PaperBroker(starting_cash=10_000, allow_short=True)
+
+    def test_slippage_worsens_sell_price(self):
+        broker = PaperBroker(starting_cash=10_000, slippage_bps=100)  # 1%
+        broker.submit_order(Order(symbol="TEST", side=Side.BUY, quantity=1))
+        broker.process_bar(make_bar(100, open_=100, index=0))
+        broker.submit_order(Order(symbol="TEST", side=Side.SELL, quantity=1))
+        fills = broker.process_bar(make_bar(100, open_=100, index=1))
+        self.assertAlmostEqual(fills[0].price, 99.0)
+
+    def test_sell_rejected_when_commission_exceeds_cash_plus_proceeds(self):
+        broker = PaperBroker(
+            starting_cash=200, commission_per_trade=150.0, slippage_bps=0
+        )
+        # Buy 1 @ 10 leaves cash 200 - 10 - 150 = 40.
+        broker.submit_order(Order(symbol="TEST", side=Side.BUY, quantity=1))
+        broker.process_bar(make_bar(10, open_=10, index=0))
+        self.assertAlmostEqual(broker.cash, 40.0)
+        # Selling for 10 cannot cover the 150 commission -> reject, cash stays >= 0.
+        broker.submit_order(Order(symbol="TEST", side=Side.SELL, quantity=1))
+        fills = broker.process_bar(make_bar(10, open_=10, index=1))
+        self.assertEqual(fills, [])
+        self.assertEqual(broker.rejected[0].reason, "insufficient cash for commission")
+        self.assertGreaterEqual(broker.cash, 0)
+
+    def test_no_cross_symbol_same_timestamp_fill(self):
+        # Seeing symbol A's bar at time T must not allow a fill on symbol
+        # B's bar at the same time T (that would trade end-of-period-T
+        # information at period-T prices).
+        broker = PaperBroker(starting_cash=100_000, slippage_bps=0)
+        broker.process_bar(make_bar(150, symbol="A", index=0))
+        broker.submit_order(Order(symbol="B", side=Side.BUY, quantity=10))
+        fills_same_ts = broker.process_bar(make_bar(100, symbol="B", index=0))
+        self.assertEqual(fills_same_ts, [])
+        fills_next = broker.process_bar(
+            make_bar(120, symbol="B", open_=110, index=1)
+        )
+        self.assertEqual(len(fills_next), 1)
+        self.assertEqual(fills_next[0].price, 110)
 
     def test_cancel_order(self):
         order = self.broker.submit_order(Order(symbol="TEST", side=Side.BUY, quantity=1))

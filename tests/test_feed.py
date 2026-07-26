@@ -31,6 +31,15 @@ class TestCSVDataFeed(unittest.TestCase):
         with self.assertRaises(FeedError):
             list(CSVDataFeed(path, "TEST"))
 
+    def test_rejects_duplicate_timestamps(self):
+        path = self._write(
+            "timestamp,open,high,low,close,volume\n"
+            "2025-01-01T00:00:00+00:00,100,102,99,101,5000\n"
+            "2025-01-01T00:00:00+00:00,101,103,100,102,6000\n"
+        )
+        with self.assertRaises(FeedError):
+            list(CSVDataFeed(path, "TEST"))
+
     def test_rejects_out_of_order_timestamps(self):
         path = self._write(
             "timestamp,open,high,low,close,volume\n"

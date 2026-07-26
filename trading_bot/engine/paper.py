@@ -2,8 +2,16 @@
 
 Runs the same per-bar event sequence as the backtester
 (:func:`trading_bot.engine.backtest.run_bar`) over a live-ish feed,
-printing a status line per bar and persisting broker state to a JSON
+printing a status line per bar and persisting session state to a JSON
 file after every bar so a session can be stopped and resumed.
+
+Persisted per session: broker state (cash, positions, fill log), the
+drawdown guard's peak/tripped state, the halted flag, and the order-id
+counter — so a tripped kill-switch stays tripped across restarts and
+fill ids stay unique. NOT persisted: strategy indicator state, which
+re-warms from live bars on resume (strategies only enter when flat, so
+a held position is not doubled, but an exit signal can be missed until
+indicators are warm again).
 """
 
 from __future__ import annotations
@@ -12,6 +20,7 @@ import json
 from pathlib import Path
 from typing import Callable, Iterable
 
+from trading_bot import models
 from trading_bot.broker.paper import PaperBroker
 from trading_bot.engine.backtest import run_bar
 from trading_bot.metrics import EquityPoint, compute
@@ -30,6 +39,7 @@ class PaperTradingEngine:
         state_path: str | Path | None = None,
         guard: DrawdownGuard | None = None,
         printer: Callable[[str], None] = print,
+        halted: bool = False,
     ):
         self.feed = feed
         self.strategy = strategy
@@ -38,16 +48,40 @@ class PaperTradingEngine:
         self.guard = guard
         self.printer = printer
         self.equity_curve: list[EquityPoint] = []
-        self._halted = False
+        self._halted = halted
 
     @staticmethod
-    def load_broker(state_path: str | Path, default: PaperBroker) -> PaperBroker:
-        """Resume from a saved session if the state file exists."""
+    def load_session(
+        state_path: str | Path,
+        default_broker: PaperBroker,
+        default_guard: DrawdownGuard | None = None,
+    ) -> tuple[PaperBroker, DrawdownGuard | None, bool]:
+        """Resume a saved session if the state file exists.
+
+        Returns ``(broker, guard, halted)``. When a state file is found,
+        the broker (including its cost settings), the guard's tripped
+        state and the halted flag all come from the file — a tripped
+        drawdown guard therefore stays tripped across restarts — and the
+        order-id counter is fast-forwarded past all persisted fills.
+        """
         path = Path(state_path)
         if not path.exists():
-            return default
-        with path.open() as fh:
-            return PaperBroker.from_state(json.load(fh))
+            return default_broker, default_guard, False
+        state = json.loads(path.read_text())
+        if "broker" not in state:  # v1 file: broker fields at top level
+            state = {"broker": state, "guard": None, "halted": False}
+        broker = PaperBroker.from_state(state["broker"])
+        guard = (
+            DrawdownGuard.from_state(state["guard"])
+            if state.get("guard")
+            else default_guard
+        )
+        next_id = state.get("next_order_id")
+        if next_id is None and broker.fills:
+            next_id = max(f.order_id for f in broker.fills) + 1
+        if next_id is not None:
+            models.ensure_order_ids_at_least(next_id)
+        return broker, guard, bool(state.get("halted"))
 
     def run(self, max_bars: int | None = None) -> None:
         last_prices: dict[str, float] = {}
@@ -69,7 +103,10 @@ class PaperTradingEngine:
                 if max_bars is not None and bars >= max_bars:
                     break
         except KeyboardInterrupt:
-            self.printer("\nStopped by user; state saved.")
+            if self.state_path is not None:
+                self.printer("\nStopped by user; state saved.")
+            else:
+                self.printer("\nStopped by user.")
         self._summary()
 
     def _report(self, bar: Bar, point: EquityPoint) -> None:
@@ -84,9 +121,15 @@ class PaperTradingEngine:
     def _save_state(self) -> None:
         if self.state_path is None:
             return
+        payload = {
+            "broker": self.broker.to_state(),
+            "guard": self.guard.to_state() if self.guard is not None else None,
+            "halted": self._halted,
+            "next_order_id": models.peek_next_order_id(),
+        }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.broker.to_state(), indent=2))
+        tmp.write_text(json.dumps(payload, indent=2))
         tmp.replace(self.state_path)  # atomic on POSIX: no torn state files
 
     def _summary(self) -> None:

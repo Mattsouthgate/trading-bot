@@ -83,17 +83,81 @@ class TestPaperTradingEngine(unittest.TestCase):
             engine.run()
             self.assertTrue(state.exists())
             saved = json.loads(state.read_text())
-            self.assertEqual(saved["starting_cash"], 25_000)
-            self.assertEqual(len(saved["fills"]), 1)
+            self.assertEqual(saved["broker"]["starting_cash"], 25_000)
+            self.assertEqual(len(saved["broker"]["fills"]), 1)
+            self.assertFalse(saved["halted"])
 
-            resumed = PaperTradingEngine.load_broker(state, PaperBroker())
+            resumed, guard, halted = PaperTradingEngine.load_session(
+                state, PaperBroker()
+            )
             self.assertEqual(resumed.get_position("X").quantity, 10)
             self.assertAlmostEqual(resumed.cash, broker.cash)
+            self.assertFalse(halted)
 
-    def test_load_broker_returns_default_when_no_state(self):
+    def test_load_session_returns_defaults_when_no_state(self):
         default = PaperBroker(starting_cash=1234)
-        loaded = PaperTradingEngine.load_broker("/nonexistent/state.json", default)
-        self.assertIs(loaded, default)
+        default_guard = DrawdownGuard(0.5)
+        broker, guard, halted = PaperTradingEngine.load_session(
+            "/nonexistent/state.json", default, default_guard
+        )
+        self.assertIs(broker, default)
+        self.assertIs(guard, default_guard)
+        self.assertFalse(halted)
+
+    def test_resume_keeps_drawdown_guard_tripped(self):
+        # A tripped kill-switch must survive a process restart: the
+        # resumed session may not trade again.
+        closes = [100, 100, 100] + [100 - 6 * i for i in range(1, 10)]
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            broker = PaperBroker(starting_cash=10_000, slippage_bps=0,
+                                 commission_per_trade=0)
+            engine = PaperTradingEngine(
+                make_series(closes, symbol="X"), BuyOnceStrategy(80), broker,
+                state_path=state, guard=DrawdownGuard(0.10),
+                printer=lambda _: None,
+            )
+            engine.run()
+            self.assertTrue(engine._halted)
+            fills_before = len(broker.fills)
+
+            resumed, guard, halted = PaperTradingEngine.load_session(
+                state, PaperBroker(), DrawdownGuard(0.10)
+            )
+            self.assertTrue(halted)
+            self.assertTrue(guard.tripped)
+
+            # Rising prices that would normally trigger a fresh buy.
+            rally = make_series([60, 65, 70, 75, 80, 85, 90], symbol="X")
+            engine2 = PaperTradingEngine(
+                rally, BuyOnceStrategy(10), resumed,
+                state_path=state, guard=guard, halted=halted,
+                printer=lambda _: None,
+            )
+            engine2.run()
+            self.assertEqual(len(resumed.fills), fills_before)  # no new trades
+
+    def test_order_ids_stay_unique_after_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            feed = SyntheticDataFeed("X", bars=5, seed=3, realtime=False)
+            engine = PaperTradingEngine(
+                feed, BuyOnceStrategy(10), PaperBroker(),
+                state_path=state, printer=lambda _: None,
+            )
+            engine.run()
+
+            # Simulate a fresh process, where the module-level counter
+            # would restart at 1 and collide with persisted fill ids.
+            from trading_bot import models
+            original = models._order_ids
+            models._order_ids = models._OrderIdGenerator()
+            self.addCleanup(setattr, models, "_order_ids", original)
+
+            resumed, _, _ = PaperTradingEngine.load_session(state, PaperBroker())
+            existing_ids = {f.order_id for f in resumed.fills}
+            new_id = models._order_ids()
+            self.assertNotIn(new_id, existing_ids)
 
     def test_max_bars_limits_run(self):
         feed = SyntheticDataFeed("X", bars=100, seed=3, realtime=False)

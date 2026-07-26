@@ -23,10 +23,13 @@ check the drawdown guard. The paper engine adds only pacing, printing and
 persistence. Any change to trading semantics automatically applies to both.
 
 **No look-ahead by construction.** Orders submitted while observing bar *N*
-cannot fill before bar *N+1*. This is enforced in the broker (fills only happen
-inside `process_bar`, which runs *before* the strategy sees the bar), not by
-strategy discipline. A strategy physically cannot buy at a close it has just
-observed.
+cannot fill before bar *N+1*. Two mechanisms enforce this in the broker, not
+by strategy discipline: fills only happen inside `process_bar`, which runs
+*before* the strategy sees the bar; and every order is stamped at submission
+with the timestamp of the last bar the broker processed, and may only fill on
+a bar with a strictly later timestamp. The stamp is what closes the
+cross-symbol hole (found by independent audit): without it, seeing symbol A's
+close at time T could fill an order on symbol B's bar at the same time T.
 
 **Strict layering, dependencies point inward.**
 
@@ -86,16 +89,32 @@ about" column, the layering is eroding.
   orders fill when the bar range crosses the limit, at the better of limit and
   open (gap price improvement). Flat commission per fill. Buys are rejected on
   insufficient cash, sells on insufficient position (no shorting by default).
-* **Paper persistence** — broker state (cash, positions, fills) is written
-  atomically (`write temp + rename`) to JSON after every bar; a session
-  resumes exactly where it stopped, including across crashes.
+* **Paper persistence** — session state is written atomically
+  (`write temp + rename`) to JSON after every bar: broker state (cash,
+  positions, fill log), the drawdown guard's peak/tripped state, the halted
+  flag, and the order-id counter. A tripped guard therefore stays tripped
+  across restarts, and fill ids stay unique. What is *not* persisted:
+  strategy indicator state, which re-warms from live bars on resume —
+  strategies only enter when flat so a held position is never doubled, but an
+  exit signal can be missed until indicators are warm again. Resuming also
+  ignores `--cash/--commission/--slippage-bps` (the saved session's settings
+  win); the CLI says so explicitly, and refuses to resume a session whose
+  held positions don't match the feed's symbol.
 * **Drawdown guard** — portfolio-level kill switch: at N% below peak equity it
-  cancels open orders, liquidates, and halts the strategy for the rest of the
-  run. Deliberately latching (never un-trips) — restarting after a blowout
-  should be a human decision.
+  cancels open orders, liquidates every position, and halts the strategy for
+  the rest of the run. Latching, including across process restarts (the
+  tripped state is persisted) — restarting after a blowout is a human
+  decision, made by deleting the state file. Caveat: liquidation is a market
+  order for the next bar, so a guard trip on the *final* bar of a backtest
+  leaves the position open; the CLI reports this case distinctly.
 * **Metrics** — Sharpe is reported *per bar* and unannualised because the
   framework doesn't assume a bar interval; compare runs at the same interval.
-  Round trips are FIFO-matched per symbol.
+  Round trips are FIFO-matched per symbol, net of commissions on both sides
+  (entry commission is carried per-lot and charged pro-rata as lots close).
+* **Short selling is not supported.** `allow_short=True` raises
+  `NotImplementedError` at construction rather than silently producing wrong
+  accounting (short avg-price, cover PnL and guard liquidation would all need
+  dedicated handling that does not exist yet).
 
 ## 5. Honest assessment for long-term maintenance
 
@@ -107,7 +126,7 @@ about" column, the layering is eroding.
 2. **The invariants are enforced structurally**, not by convention: no
    look-ahead (broker fill timing), no engine drift (shared `run_bar`), no
    silent bad data (validating feed), no torn state files (atomic writes).
-3. **54 fast, deterministic tests** covering fill timing, rejection paths,
+3. **64 fast, deterministic tests** covering fill timing, rejection paths,
    limit-order edge cases, state round-tripping, guard liquidation, metric
    values against hand-computed numbers, and CLI end-to-end smoke tests.
    The suite runs in well under a second, so there is no excuse not to run it.
@@ -125,20 +144,31 @@ about" column, the layering is eroding.
    routes real orders. Before any real-broker adapter, migrate cash/position
    accounting in `broker/paper.py` to `decimal.Decimal` (the tests pin current
    behaviour, which makes that migration safe).
-3. **Effectively single-symbol.** The broker and engines handle multiple
-   symbols, but the drawdown guard liquidates only the current bar's symbol
-   and the CLI wires one feed. Multi-symbol needs a feed multiplexer and a
-   portfolio-wide liquidation path — a contained change in `engine/` and
-   `risk.py`.
+3. **Effectively single-symbol at the CLI.** The broker, fill timing
+   (including cross-symbol timestamp checks) and guard liquidation all handle
+   multiple symbols, but the CLI wires exactly one feed. Multi-symbol trading
+   needs a feed multiplexer and multi-feed CLI plumbing.
 4. **Simplified microstructure.** No partial fills, order book depth, volume
    limits, borrow costs, or overnight gaps modelling. Every backtest is
    optimistic to some degree; treat results as relative strategy comparisons,
    not absolute P&L forecasts.
-5. **Strategy parameters are code-level defaults.** The CLI can select a
+5. **Strategy indicator state is not persisted across paper restarts.**
+   Indicators re-warm from live bars, so a resumed session is briefly
+   signal-blind (it cannot enter — it only enters when flat and warm — but it
+   can be late to exit a held position). Fixing this properly means a
+   `Strategy.to_state()/from_state()` protocol; do it when a real-money
+   adapter makes it matter.
+6. **The persistence protocol is `PaperBroker`-specific.** The `Broker` ABC
+   now covers everything the engines call during trading (`open_orders`,
+   `positions`, etc.), so a real adapter drops into the *event loop*
+   unchanged — but `to_state`/`from_state` live on `PaperBroker`, so session
+   persistence would need a small state protocol on the ABC (or become a
+   no-op for a broker that holds its own state server-side).
+7. **Strategy parameters are code-level defaults.** The CLI can select a
    strategy but not yet pass, e.g., `--fast 5 --slow 20`. Add per-strategy
    argparse groups or a small config file when tuning becomes routine —
    resist the temptation to grow a config framework before then.
-6. **`print`-based reporting.** Adequate at this size; switch to the stdlib
+8. **`print`-based reporting.** Adequate at this size; switch to the stdlib
    `logging` module when a real feed introduces retries/timeouts worth
    diagnosing after the fact.
 
@@ -164,3 +194,31 @@ about" column, the layering is eroding.
   (see the table in §3).
 * CI (GitHub Actions) runs the suite on every push across supported Python
   versions; keep it green.
+
+## 6. Audit record
+
+**2026-07-24 — independent adversarial audit** of the initial implementation
+(a separate agent, read-only, with reproduction scripts required for every
+claimed bug). Verified findings and their resolutions, kept here because
+knowing *why* code is shaped a certain way is half of maintenance:
+
+| Finding | Severity | Resolution |
+|---|---|---|
+| Cross-symbol look-ahead: order placed on A@T could fill on B@T | major | Orders stamped with submission time; fills require a strictly later bar (`broker/paper.py`), regression test added |
+| Paper restart silently un-tripped the drawdown guard and re-entered the market | major | Guard peak/tripped + halted flag persisted in session state; CLI announces a halted session; test pins it |
+| Round-trip PnL ignored buy-side commission, inflating win rate / profit factor | major | Per-lot pro-rata entry commission in `metrics.round_trips`; tests fixed (one had pinned the bug) |
+| `allow_short=True` produced broken accounting (avg-price, cover PnL, guard skip) | major | Now raises `NotImplementedError` until properly implemented |
+| Order ids restarted at 1 per process, duplicating ids in the persisted fill log | minor | Order-id counter persisted and fast-forwarded on resume |
+| Resume with a different `--symbol` crashed with `KeyError`; CLI flags silently ignored on resume | minor | Friendly startup validation + explicit resume notice |
+| Guard liquidation only flattened the current bar's symbol | minor | Liquidates all positions via new `Broker.positions()` |
+| Sell commission could overdraw cash | minor | Sells rejected when commission exceeds cash + proceeds |
+| "Liquidated" printed even when the guard tripped on the final bar (order never filled) | minor | CLI distinguishes the liquidation-pending case |
+| Engine called `PaperBroker`-only methods, weakening the "adapter drops in" claim | minor | `open_orders()`/`positions()` added to the `Broker` ABC; remaining gap (state protocol) documented in §5 |
+
+Also from the audit: test gaps closed (sell-side slippage, duplicate CSV
+timestamps, RSI vs. an independent Wilder reference, resumed-engine
+behaviour), and the docs claims corrected above. Suite grew from 54 to 64
+tests. Non-findings worth recording: SMA rolling-sum drift measured
+negligible (~5e-8 after 2M updates), limit-order fill logic, slippage
+directions, drawdown/Sharpe math and atomic state writes all verified
+correct.

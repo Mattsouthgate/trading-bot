@@ -57,14 +57,13 @@ def run_bar(
     equity = broker.equity(last_prices)
 
     if guard is not None and guard.update(equity) and not trading_halted:
-        # Liquidate everything at the next bar and stop trading.
+        # Liquidate every position at the next bar and stop trading.
         trading_halted = True
         for order in broker.open_orders():
             broker.cancel_order(order.id)
-        pos = broker.get_position(bar.symbol)
-        if pos.quantity > 0:
+        for pos in broker.positions():
             broker.submit_order(
-                Order(symbol=bar.symbol, side=Side.SELL, quantity=pos.quantity)
+                Order(symbol=pos.symbol, side=Side.SELL, quantity=pos.quantity)
             )
     return EquityPoint(timestamp=bar.timestamp, equity=equity), trading_halted
 

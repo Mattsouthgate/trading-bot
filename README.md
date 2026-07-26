@@ -20,7 +20,9 @@ python -m trading_bot backtest --data data/sample/DEMO.csv --strategy rsi
 # 3. Paper trade on a simulated live feed (1-minute bars at 60x speed)
 python -m trading_bot paper --strategy sma --speed 60
 #    ... Ctrl-C to stop; the session persists to .paper/state.json and
-#    resumes from there next time. Add --bars 100 to auto-stop.
+#    resumes from there next time (cash, positions, fill log, drawdown-guard
+#    state and the halt flag all carry over; a tripped guard stays tripped
+#    until you delete the state file). Add --bars 100 to auto-stop.
 
 # Run the test suite
 python -m unittest discover -s tests
@@ -79,16 +81,22 @@ class MyStrategy(Strategy):
 
 Orders placed on bar *N* fill no earlier than bar *N+1*'s open (market orders)
 or when price crosses the limit (limit orders) — the framework will not let a
-strategy trade on a close it has only just observed.
+strategy trade on a close it has only just observed. This holds across
+symbols too: the broker stamps each order with the timestamp of the last bar
+it processed and only fills on a strictly later bar, so seeing symbol A's
+close cannot buy symbol B at that same period's prices.
 
 ## How fills are simulated
 
 * Market orders fill at the **next bar's open** plus slippage (`--slippage-bps`).
 * Limit orders fill when the bar range crosses the limit, at the better of the
   limit price and the bar open (gap price improvement).
-* A flat per-trade commission (`--commission`) is charged on every fill.
+* A flat per-trade commission (`--commission`) is charged on every fill, and
+  round-trip PnL (win rate, profit factor) is net of commissions on both the
+  entry and the exit.
 * Buys that would overdraw cash and sells exceeding the held quantity are
-  rejected (no shorting by default).
+  rejected. Short selling is not supported (`allow_short=True` raises
+  `NotImplementedError` rather than producing wrong accounting).
 
 ## Project layout
 
@@ -107,7 +115,7 @@ trading_bot/
 │   ├── backtest.py      # event loop + result/metrics assembly
 │   └── paper.py         # same loop over a live feed, with state persistence
 └── cli.py               # backtest / paper / generate-data commands
-tests/                   # 54 unit + integration tests (stdlib unittest)
+tests/                   # 64 unit + integration tests (stdlib unittest)
 docs/ARCHITECTURE.md     # structure evaluation & maintenance guide
 ```
 
